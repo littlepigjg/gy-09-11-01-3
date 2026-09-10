@@ -1,0 +1,97 @@
+name: tsdb
+
+services:
+  # ---------------------------------------------------------------
+  # MySQL 8.0 时序数据库 (含分区表/事件/存储过程自动初始化)
+  # ---------------------------------------------------------------
+  mysql:
+    image: mysql:8.0
+    container_name: tsdb-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      TZ: Asia/Shanghai
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_bin
+      - --event-scheduler=ON
+      - --default-authentication-plugin=mysql_native_password
+    volumes:
+      - mysql_data:/var/lib/mysql
+      # 首次启动自动执行建库建表/分区/事件
+      - ./schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-proot"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    ports:
+      - "3306:3306"
+    networks:
+      - tsdb-net
+
+  # ---------------------------------------------------------------
+  # Python FastAPI 后端 (写入/聚合/降采样/异常检测)
+  # ---------------------------------------------------------------
+  backend:
+    build: ./backend
+    container_name: tsdb-backend
+    restart: unless-stopped
+    environment:
+      DB_HOST: mysql
+      DB_PORT: "3306"
+      DB_USER: root
+      DB_PASSWORD: root
+      DB_NAME: tsdb
+      TZ: Asia/Shanghai
+    depends_on:
+      mysql:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/api/health')"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    ports:
+      - "8000:8000"
+    networks:
+      - tsdb-net
+
+  # ---------------------------------------------------------------
+  # 数据模拟器 (回填历史数据 + 持续实时写入)
+  # ---------------------------------------------------------------
+  simulator:
+    build: ./backend
+    container_name: tsdb-simulator
+    restart: unless-stopped
+    environment:
+      API_URL: http://backend:8000
+      TZ: Asia/Shanghai
+    depends_on:
+      backend:
+        condition: service_healthy
+    # 库为空时自动回填 48 小时历史数据, 之后持续实时写入(重启不重复回填)
+    command: ["python", "simulator.py", "auto", "48"]
+    networks:
+      - tsdb-net
+
+  # ---------------------------------------------------------------
+  # Vue3 前端 (Nginx 托管静态资源 + /api 反向代理)
+  # ---------------------------------------------------------------
+  frontend:
+    build: ./frontend
+    container_name: tsdb-frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "80:80"
+    networks:
+      - tsdb-net
+
+volumes:
+  mysql_data:
+
+networks:
+  tsdb-net:
+    driver: bridge

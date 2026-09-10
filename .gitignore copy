@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.pyc
+backend/.venv/
+
+# Node
+frontend/node_modules/
+frontend/dist/
+
+# 日志
+*.log
+
+# 本地 MySQL 数据卷(由 Docker 管理, 不入库)
+mysql_data/

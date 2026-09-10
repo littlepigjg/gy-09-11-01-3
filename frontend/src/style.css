@@ -1,0 +1,92 @@
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+  font-family: -apple-system, 'PingFang SC', 'Microsoft YaHei', sans-serif;
+  background: #0f1420;
+  color: #d7dde8;
+  min-height: 100vh;
+}
+
+#app { max-width: 1400px; margin: 0 auto; padding: 20px; }
+
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 24px;
+  background: linear-gradient(135deg, #1a2235 0%, #16202e 100%);
+  border-radius: 12px;
+  border: 1px solid #26314a;
+  margin-bottom: 20px;
+}
+
+.header h1 {
+  font-size: 20px;
+  font-weight: 600;
+  background: linear-gradient(90deg, #4fc3f7, #7c4dff);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+.stats { display: flex; gap: 24px; }
+.stat { text-align: right; }
+.stat .num { font-size: 22px; font-weight: 700; color: #4fc3f7; font-variant-numeric: tabular-nums; }
+.stat .label { font-size: 12px; color: #7a869e; }
+
+.toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: center;
+  padding: 14px 18px;
+  background: #161d2c;
+  border-radius: 10px;
+  border: 1px solid #26314a;
+  margin-bottom: 16px;
+}
+
+.toolbar .group { display: flex; align-items: center; gap: 8px; }
+.toolbar label { font-size: 13px; color: #8b96ad; }
+
+select, button {
+  background: #1e2940;
+  color: #d7dde8;
+  border: 1px solid #31405e;
+  border-radius: 6px;
+  padding: 6px 12px;
+  font-size: 13px;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+select:hover, button:hover { border-color: #4fc3f7; }
+button.active { background: #2b4a6f; border-color: #4fc3f7; color: #4fc3f7; }
+button.primary { background: linear-gradient(90deg, #1565c0, #4527a0); border: none; }
+
+.metric-chips { display: flex; flex-wrap: wrap; gap: 8px; }
+.chip {
+  padding: 4px 12px;
+  border-radius: 14px;
+  font-size: 12px;
+  cursor: pointer;
+  border: 1px solid #31405e;
+  background: #1a2333;
+  user-select: none;
+}
+.chip.on { background: #2b4a6f; border-color: #4fc3f7; color: #4fc3f7; }
+
+.chart-card {
+  background: #161d2c;
+  border: 1px solid #26314a;
+  border-radius: 12px;
+  padding: 16px;
+  margin-bottom: 16px;
+}
+.chart-card h3 { font-size: 14px; color: #8b96ad; margin-bottom: 8px; font-weight: 500; }
+.chart { width: 100%; height: 380px; }
+.chart-tall { height: 460px; }
+
+.meta { font-size: 12px; color: #5c6880; margin-top: 6px; }
+.meta span { margin-right: 16px; }
+.meta .hl { color: #4fc3f7; }
+
+.legend-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 4px; }
