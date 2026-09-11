@@ -5,7 +5,8 @@
 --   2. 主键 (metric_id, ts, id) 保证分区键包含在主键中
 --   3. 覆盖索引加速 (metric_id, ts) 范围扫描
 --   4. metric_data_hourly 预聚合表: 后台任务定期降采样, 查询大时间范围直接命中
---   5. 数据过期: 定时 EVENT 每日 DROP 最老分区并追加新分区 (避免 DELETE 产生碎片)
+--   5. 指标业务状态 active/silent/archived: 活跃参与查询检测, 静默只采集, 归档拒写并可清理
+--   6. 数据过期: 定时 EVENT 每日 DROP 最老分区并追加新分区 (避免 DELETE 产生碎片)
 -- =============================================================
 
 CREATE DATABASE IF NOT EXISTS tsdb DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_bin;
@@ -18,9 +19,13 @@ CREATE TABLE IF NOT EXISTS metrics (
     instance    VARCHAR(64)  NOT NULL DEFAULT '' COMMENT '实例/主机标识',
     unit        VARCHAR(16)  NOT NULL DEFAULT '' COMMENT '单位',
     description VARCHAR(255) NOT NULL DEFAULT '',
+    status      ENUM('active', 'silent', 'archived') NOT NULL DEFAULT 'active' COMMENT '业务状态:活跃/静默/归档',
+    version     INT UNSIGNED NOT NULL DEFAULT 0 COMMENT '状态乐观锁版本',
+    status_updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) COMMENT '状态最后变更时间',
     created_at  DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (id),
-    UNIQUE KEY uk_name_instance (name, instance)
+    UNIQUE KEY uk_name_instance (name, instance),
+    KEY idx_status_name (status, name, instance)
 ) ENGINE=InnoDB COMMENT='指标元数据';
 
 -- ---------------------------------------------------------------
@@ -127,13 +132,17 @@ END $$
 DROP PROCEDURE IF EXISTS p_downsample_hour $$
 CREATE PROCEDURE p_downsample_hour(IN hour_start DATETIME)
 BEGIN
+    -- 活跃和静默指标仍参与预聚合; 归档指标不再产生新的预聚合数据。
+    -- 静默预聚合结果会在查询入口按 metrics.status='active' 被排除。
     INSERT INTO metric_data_hourly (metric_id, bucket_ts, avg_value, min_value, max_value, sum_value, point_count)
-    SELECT metric_id,
+    SELECT d.metric_id,
            hour_start,
-           AVG(value), MIN(value), MAX(value), SUM(value), COUNT(*)
-      FROM metric_data
-     WHERE ts >= hour_start AND ts < hour_start + INTERVAL 1 HOUR
-     GROUP BY metric_id
+           AVG(d.value), MIN(d.value), MAX(d.value), SUM(d.value), COUNT(*)
+      FROM metric_data d
+      JOIN metrics m ON m.id = d.metric_id
+     WHERE d.ts >= hour_start AND d.ts < hour_start + INTERVAL 1 HOUR
+       AND m.status IN ('active', 'silent')
+     GROUP BY d.metric_id
     ON DUPLICATE KEY UPDATE
         avg_value   = VALUES(avg_value),
         min_value   = VALUES(min_value),

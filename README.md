@@ -10,7 +10,9 @@
 - **降采样聚合**：SQL 侧时间桶聚合（min/max/avg/sum），桶大小按时间跨度自动对齐（1s~1d）
 - **预聚合加速**：小时级物化表，跨度 >7 天查询自动路由，30 天查询毫秒级返回
 - **异常点检测**：滑动窗口 Z-Score 算法，曲线上红色高亮标注
-- **实时可视化**：实时曲线、多指标对比、时间范围/聚合方式切换、图表缩放
+- **指标业务状态流转**：支持活跃、静默、归档三种状态；静默继续采集但自动隐藏查询和异常结果，归档拒绝新写入并支持显式清理历史数据
+- **状态并发控制**：状态行锁 + `version` 乐观锁保证多人同时操作不会相互覆盖，状态切换与可见性切换在同一数据库事务提交点原子生效
+- **实时可视化**：实时曲线、多指标对比、时间范围/聚合方式切换、图表缩放、指标状态管理
 
 ## 快速开始
 
@@ -102,8 +104,10 @@ tsdb/
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | POST | `/api/write` | 批量写入数据点 |
-| GET | `/api/metrics` | 指标列表与数据点统计 |
-| GET | `/api/query` | 聚合 + 降采样查询（`metrics/start/end/agg/bucket`） |
+| GET | `/api/metrics` | 指标列表、状态、版本与数据点统计，可用 `?status=active` 过滤 |
+| PATCH | `/api/metrics/{id}/status` | 修改指标状态（活跃/静默/归档），需携带 `expected_version` |
+| POST | `/api/metrics/{id}/cleanup-archive` | 清理归档指标的原始数据和小时预聚合数据 |
+| GET | `/api/query` | 聚合 + 降采样查询（`metrics/start/end/agg/bucket`），仅返回活跃指标 |
 | GET | `/api/latest` | 最近窗口原始点（实时曲线） |
 | GET | `/api/anomalies` | 滑动窗口 Z-Score 异常点检测 |
 | GET | `/api/health` | 健康检查 |
@@ -114,6 +118,20 @@ tsdb/
 curl -X POST http://localhost:8000/api/write \
   -H 'Content-Type: application/json' \
   -d '{"points":[{"metric":"cpu.usage","instance":"host-1","value":42.5}]}'
+```
+
+状态切换示例（`expected_version` 取自 `/api/metrics`；并发冲突会返回 409）：
+
+```bash
+curl -X PATCH http://localhost:8000/api/metrics/1/status \
+  -H 'Content-Type: application/json' \
+  -d '{"status":"silent","expected_version":0}'
+```
+
+归档后清理历史数据：
+
+```bash
+curl -X POST http://localhost:8000/api/metrics/1/cleanup-archive
 ```
 
 聚合查询示例（时间戳为 Unix 秒）：
@@ -133,7 +151,19 @@ curl "http://localhost:8000/api/query?metrics=cpu.usage,mem.usage&start=17888000
 1. 在线桶聚合：`GROUP BY FLOOR(UNIX_TIMESTAMP(ts)/bucket)`，桶大小按跨度自动选择。
 2. 预聚合表 `metric_data_hourly`：事件每小时增量聚合；大跨度查询自动改查预聚合表，avg 以 `SUM(sum)/SUM(count)` 加权保证准确性。
 
-**异常检测**：对每个数据点用其前 N 个点（默认 20）计算均值与标准差，`|z| > 阈值（默认 3）`判定为异常并返回坐标，前端以红色散点叠加在曲线上。
+**异常检测**：对每个数据点用其前 N 个点（默认 20）计算均值与标准差，`|z| > 阈值（默认 3）`判定为异常并返回坐标，前端以红色散点叠加在曲线上。静默和归档指标不会进入检测扫描。
+
+**指标状态流转**：
+
+| 状态 | 新数据采集 | 查询/最新值 | 异常检测 | 历史数据 |
+| --- | --- | --- | --- | --- |
+| `active` 活跃 | 接受 | 可见 | 参与 | 正常保留 |
+| `silent` 静默 | 接受并写入 | 不可见 | 不参与 | 保留，小时预聚合继续生成 |
+| `archived` 归档 | 拒绝 | 不可见 | 不参与 | 保留但可调用清理接口删除 |
+
+状态以 `metrics.status` 为唯一事实源，不维护异步缓存。聚合查询、实时查询、异常检测在事务中先以 `FOR SHARE` 锁定匹配的元数据行，再查询数据；状态更新使用 `FOR UPDATE` 和 `version` 乐观锁。读写事务通过 InnoDB 行锁在状态提交点形成线性一致的前后关系，避免“状态已变更但旧数据仍可见”或“已归档仍写入”的交叉结果。
+
+批量写入中如果混有归档指标，有效指标仍会提交；归档点通过响应体 `rejected` 返回原因和批次下标。归档恢复为活跃/静默时，后端会在状态提交同一事务内补齐该指标缺失的小时预聚合桶，保证恢复后大跨度查询和原始查询同时恢复可见。
 
 ## 本地开发（可选）
 

@@ -13,10 +13,10 @@ import os
 import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Literal, Optional
 
 import pymysql
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -83,6 +83,67 @@ app.add_middleware(
 )
 
 
+DOWNSAMPLE_HOUR_PROCEDURE = """
+CREATE PROCEDURE p_downsample_hour(IN hour_start DATETIME)
+BEGIN
+    INSERT INTO metric_data_hourly (metric_id, bucket_ts, avg_value, min_value, max_value, sum_value, point_count)
+    SELECT d.metric_id,
+           hour_start,
+           AVG(d.value), MIN(d.value), MAX(d.value), SUM(d.value), COUNT(*)
+      FROM metric_data d
+      JOIN metrics m ON m.id = d.metric_id
+     WHERE d.ts >= hour_start AND d.ts < hour_start + INTERVAL 1 HOUR
+       AND m.status IN ('active', 'silent')
+     GROUP BY d.metric_id
+    ON DUPLICATE KEY UPDATE
+        avg_value   = VALUES(avg_value),
+        min_value   = VALUES(min_value),
+        max_value   = VALUES(max_value),
+        sum_value   = VALUES(sum_value),
+        point_count = VALUES(point_count);
+END
+"""
+
+
+@app.on_event("startup")
+def ensure_schema():
+    """兼容已存在的数据卷: schema.sql 只在 MySQL 首次初始化时执行。"""
+    with pool.acquire() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT COLUMN_NAME FROM information_schema.COLUMNS "
+            "WHERE TABLE_SCHEMA=%s AND TABLE_NAME='metrics'",
+            (DB_CONFIG["database"],),
+        )
+        columns = {row["COLUMN_NAME"] for row in cur.fetchall()}
+        if "status" not in columns:
+            cur.execute(
+                "ALTER TABLE metrics "
+                "ADD COLUMN status ENUM('active','silent','archived') NOT NULL DEFAULT 'active' "
+                "COMMENT '业务状态:活跃/静默/归档' AFTER description"
+            )
+        if "version" not in columns:
+            cur.execute(
+                "ALTER TABLE metrics ADD COLUMN version INT UNSIGNED NOT NULL DEFAULT 0 AFTER status"
+            )
+        if "status_updated_at" not in columns:
+            cur.execute(
+                "ALTER TABLE metrics "
+                "ADD COLUMN status_updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) AFTER version"
+            )
+
+        cur.execute(
+            "SELECT INDEX_NAME FROM information_schema.STATISTICS "
+            "WHERE TABLE_SCHEMA=%s AND TABLE_NAME='metrics' AND INDEX_NAME='idx_status_name'",
+            (DB_CONFIG["database"],),
+        )
+        if not cur.fetchone():
+            cur.execute("ALTER TABLE metrics ADD INDEX idx_status_name (status, name, instance)")
+
+        # 升级旧版本存储过程, 让小时级预聚合也遵守归档拒聚合规则。
+        cur.execute("DROP PROCEDURE IF EXISTS p_downsample_hour")
+        cur.execute(DOWNSAMPLE_HOUR_PROCEDURE)
+
+
 # ---------------------------------------------------------------
 # 健康检查 (供容器编排 healthcheck 使用)
 # ---------------------------------------------------------------
@@ -107,11 +168,19 @@ class BatchWriteRequest(BaseModel):
     points: list[DataPoint]
 
 
+MetricStatus = Literal["active", "silent", "archived"]
+
+
+class MetricStatusUpdate(BaseModel):
+    status: MetricStatus
+    expected_version: int = Field(..., ge=0, description="乐观锁版本, 来自当前指标元数据")
+
+
 # ---------------------------------------------------------------
 # 工具函数
 # ---------------------------------------------------------------
 def _get_metric_id(cursor, name: str, instance: str) -> int:
-    """获取或创建指标ID (upsert)。"""
+    """获取或创建指标ID (upsert), 新指标默认活跃。"""
     cursor.execute(
         "INSERT INTO metrics (name, instance) VALUES (%s, %s) "
         "ON DUPLICATE KEY UPDATE id=LAST_INSERT_ID(id)",
@@ -120,17 +189,35 @@ def _get_metric_id(cursor, name: str, instance: str) -> int:
     return cursor.lastrowid
 
 
-def _resolve_metric_ids(cursor, names: list[str], instance: str = "") -> dict[str, list[int]]:
+def _resolve_metric_ids(
+    cursor,
+    names: list[str],
+    instance: str = "",
+    *,
+    active_only: bool = False,
+    lock: bool = False,
+) -> dict[str, list[int]]:
     """批量解析指标名 -> id 列表。
-    instance 为空时跨实例聚合, 一个指标名可能对应多个 id。"""
+    instance 为空时跨实例聚合, 一个指标名可能对应多个 id。
+    active_only 时仅返回活跃指标, 静默和归档指标对查询/检测不可见。
+    FOR SHARE 与状态变更的 FOR UPDATE 互斥, 保证状态切换和数据可见性原子切换。
+    """
     fmt = ",".join(["%s"] * len(names))
+    sql = "SELECT id, name FROM metrics"
+    clauses = []
+    params = []
     if instance:
-        cursor.execute(
-            f"SELECT id, name FROM metrics WHERE instance=%s AND name IN ({fmt})",
-            [instance, *names],
-        )
+        clauses.append("instance=%s")
+        params.append(instance)
+    clauses.append(f"name IN ({fmt})")
+    params.extend(names)
+    if active_only:
+        clauses.append("status='active'")
+    if lock:
+        sql += " WHERE " + " AND ".join(clauses) + " FOR SHARE"
     else:
-        cursor.execute(f"SELECT id, name FROM metrics WHERE name IN ({fmt})", names)
+        sql += " WHERE " + " AND ".join(clauses)
+    cursor.execute(sql, params)
     result: dict[str, list[int]] = {}
     for row in cursor.fetchall():
         result.setdefault(row["name"], []).append(row["id"])
@@ -147,45 +234,184 @@ def write_points(req: BatchWriteRequest):
     优化点:
       - 单事务 + executemany 批量插入, 减少 round-trip 和 redo log 刷盘次数
       - 指标元数据 upsert 与数据写入同事务
+      - 活跃/静默指标均接受新数据; 归档指标拒绝新数据
+      - 写入时锁定元数据行, 避免归档提交与新数据写入交叉
     """
     if not req.points:
-        return {"inserted": 0}
+        return {"inserted": 0, "rejected": []}
     t0 = time.perf_counter()
     now = time.time()
     with pool.acquire() as conn, conn.cursor() as cur:
-        # 1. 解析所有指标ID (按 (name, instance) 去重)
+        # 1. 解析所有指标ID (按 (name, instance) 去重, 固定加锁顺序降低并发写入死锁概率)
+        metric_keys = sorted({(p.metric, p.instance) for p in req.points})
         metric_ids: dict[tuple[str, str], int] = {}
-        for p in req.points:
-            key = (p.metric, p.instance)
-            if key not in metric_ids:
-                metric_ids[key] = _get_metric_id(cur, p.metric, p.instance)
-        # 2. 批量插入
-        rows = [
-            (metric_ids[(p.metric, p.instance)],
-             datetime.fromtimestamp(p.ts if p.ts is not None else now),
-             p.value)
-            for p in req.points
-        ]
-        cur.executemany(
-            "INSERT INTO metric_data (metric_id, ts, value) VALUES (%s, %s, %s)",
-            rows,
+        for name, inst in metric_keys:
+            metric_ids[(name, inst)] = _get_metric_id(cur, name, inst)
+
+        # 2. 锁定本批次涉及的元数据行并读取当前状态
+        cur.execute(
+            f"SELECT id, name, instance, status FROM metrics "
+            f"WHERE (name, instance) IN ({','.join(['(%s,%s)'] * len(metric_keys))}) "
+            "FOR UPDATE",
+            [v for key in metric_keys for v in key],
         )
+        status_by_id = {row["id"]: row["status"] for row in cur.fetchall()}
+
+        accepted_rows = []
+        rejected = []
+        # 3. 归档指标拒绝写入; 静默指标写入但后续查询和异常检测不可见
+        for idx, p in enumerate(req.points):
+            mid = metric_ids[(p.metric, p.instance)]
+            if status_by_id.get(mid) == "archived":
+                rejected.append({
+                    "index": idx,
+                    "metric": p.metric,
+                    "instance": p.instance,
+                    "reason": "metric archived",
+                })
+                continue
+            accepted_rows.append((
+                mid,
+                datetime.fromtimestamp(p.ts if p.ts is not None else now),
+                p.value,
+            ))
+
+        if accepted_rows:
+            cur.executemany(
+                "INSERT INTO metric_data (metric_id, ts, value) VALUES (%s, %s, %s)",
+                accepted_rows,
+            )
     elapsed = (time.perf_counter() - t0) * 1000
-    return {"inserted": len(rows), "elapsed_ms": round(elapsed, 2)}
+    return {
+        "inserted": len(accepted_rows),
+        "rejected": rejected,
+        "elapsed_ms": round(elapsed, 2),
+    }
 
 
 # ---------------------------------------------------------------
 # API: 指标列表
 # ---------------------------------------------------------------
 @app.get("/api/metrics")
-def list_metrics():
+def list_metrics(status: Optional[MetricStatus] = Query(None, description="按状态过滤")):
+    params = []
+    where = ""
+    if status:
+        where = "WHERE m.status=%s"
+        params.append(status)
     with pool.acquire() as conn, conn.cursor() as cur:
         cur.execute(
-            "SELECT m.id, m.name, m.instance, m.unit, "
+            "SELECT m.id, m.name, m.instance, m.unit, m.status, m.version, "
+            "       UNIX_TIMESTAMP(m.status_updated_at) AS status_updated_at, "
             "       (SELECT COUNT(*) FROM metric_data d WHERE d.metric_id = m.id) AS points "
-            "FROM metrics m ORDER BY m.name"
+            "FROM metrics m "
+            f"{where} ORDER BY m.status, m.name, m.instance",
+            params,
         )
-        return cur.fetchall()
+        rows = cur.fetchall()
+    return rows
+
+
+@app.patch("/api/metrics/{metric_id}/status")
+def update_metric_status(metric_id: int, req: MetricStatusUpdate):
+    """在同一事务内完成状态版本校验、状态切换和版本递增。
+
+    状态切换的提交点即数据可见性切换点: 查询和检测事务持元数据共享锁,
+    与该更新的行级排他锁互斥; 写入事务同样持排他锁。expected_version 使用
+    乐观锁防止多人同时修改时后提交者静默覆盖先提交者。
+    """
+    with pool.acquire() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT id, name, instance, status, version FROM metrics WHERE id=%s FOR UPDATE",
+            (metric_id,),
+        )
+        metric = cur.fetchone()
+        if metric is None:
+            raise HTTPException(status_code=404, detail="metric not found")
+        if metric["version"] != req.expected_version:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": "metric status changed by another operation",
+                    "current_status": metric["status"],
+                    "current_version": metric["version"],
+                },
+            )
+        if metric["status"] == req.status:
+            return {
+                "id": metric_id,
+                "name": metric["name"],
+                "instance": metric["instance"],
+                "status": metric["status"],
+                "version": metric["version"],
+                "changed": False,
+            }
+
+        cur.execute(
+            "UPDATE metrics SET status=%s, version=version+1, status_updated_at=NOW(3) "
+            "WHERE id=%s AND version=%s",
+            (req.status, metric_id, req.expected_version),
+        )
+        if cur.rowcount != 1:
+            # FOR UPDATE 后通常不会走到这里; 兜底处理极端并发/复制场景。
+            raise HTTPException(status_code=409, detail="metric status version conflict")
+
+        # 从归档恢复时, 在同一个事务内补齐缺失的小时桶。
+        # 这样提交后无论查询走原始表还是小时预聚合表, 历史数据可见性都同时切换。
+        if metric["status"] == "archived" and req.status in ("active", "silent"):
+            cur.execute(
+                """
+                INSERT INTO metric_data_hourly
+                    (metric_id, bucket_ts, avg_value, min_value, max_value, sum_value, point_count)
+                SELECT d.metric_id,
+                       DATE_FORMAT(d.ts, '%%Y-%%m-%%d %%H:00:00') AS hour_bucket,
+                       AVG(d.value), MIN(d.value), MAX(d.value), SUM(d.value), COUNT(*)
+                  FROM metric_data d
+                  JOIN metrics m ON m.id = d.metric_id
+                  LEFT JOIN metric_data_hourly h
+                    ON h.metric_id = d.metric_id
+                   AND h.bucket_ts = DATE_FORMAT(d.ts, '%%Y-%%m-%%d %%H:00:00')
+                 WHERE d.metric_id=%s AND m.status IN ('active', 'silent')
+                   AND h.metric_id IS NULL
+                 GROUP BY d.metric_id, hour_bucket
+                """,
+                (metric_id,),
+            )
+        return {
+            "id": metric_id,
+            "name": metric["name"],
+            "instance": metric["instance"],
+            "status": req.status,
+            "version": req.expected_version + 1,
+            "changed": True,
+        }
+
+
+@app.post("/api/metrics/{metric_id}/cleanup-archive")
+def cleanup_archived_metric(metric_id: int):
+    """显式清理一个归档指标的原始数据和小时预聚合数据。
+
+    归档只负责阻断新写入并隐藏数据; 历史数据清理是高风险操作, 因此要求指标
+    已处于 archived 后单独确认。清理在同一事务内先删原始数据再删小时预聚合,
+    状态行排他锁与降采样任务的元数据读取互斥, 避免清理后又被重新聚合。
+    """
+    with pool.acquire() as conn, conn.cursor() as cur:
+        cur.execute("SELECT status FROM metrics WHERE id=%s FOR UPDATE", (metric_id,))
+        metric = cur.fetchone()
+        if metric is None:
+            raise HTTPException(status_code=404, detail="metric not found")
+        if metric["status"] != "archived":
+            raise HTTPException(status_code=409, detail="only archived metrics can be cleaned")
+        cur.execute("DELETE FROM metric_data WHERE metric_id=%s", (metric_id,))
+        raw_deleted = cur.rowcount
+        cur.execute("DELETE FROM metric_data_hourly WHERE metric_id=%s", (metric_id,))
+        hourly_deleted = cur.rowcount
+    return {
+        "id": metric_id,
+        "cleaned": True,
+        "raw_deleted": raw_deleted,
+        "hourly_deleted": hourly_deleted,
+    }
 
 
 # ---------------------------------------------------------------
@@ -237,7 +463,7 @@ def query_metrics(
     result: dict[str, list] = {}
     t0 = time.perf_counter()
     with pool.acquire() as conn, conn.cursor() as cur:
-        id_map = _resolve_metric_ids(cur, names, instance)
+        id_map = _resolve_metric_ids(cur, names, instance, active_only=True, lock=True)
         for name, mids in id_map.items():
             if not mids:
                 continue
@@ -286,7 +512,7 @@ def latest_points(
     since = datetime.fromtimestamp(time.time() - window)
     result: dict[str, list] = {}
     with pool.acquire() as conn, conn.cursor() as cur:
-        id_map = _resolve_metric_ids(cur, names, instance)
+        id_map = _resolve_metric_ids(cur, names, instance, active_only=True, lock=True)
         for name, mids in id_map.items():
             if not mids:
                 continue
@@ -319,7 +545,7 @@ def detect_anomalies(
     start_dt = datetime.fromtimestamp(start)
     end_dt = datetime.fromtimestamp(end)
     with pool.acquire() as conn, conn.cursor() as cur:
-        id_map = _resolve_metric_ids(cur, [metric], instance)
+        id_map = _resolve_metric_ids(cur, [metric], instance, active_only=True, lock=True)
         mids = id_map.get(metric, [])
         if not mids:
             return {"anomalies": []}

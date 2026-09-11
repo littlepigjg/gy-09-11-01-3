@@ -73,6 +73,20 @@ button.primary { background: linear-gradient(90deg, #1565c0, #4527a0); border: n
   user-select: none;
 }
 .chip.on { background: #2b4a6f; border-color: #4fc3f7; color: #4fc3f7; }
+.chip.silent { opacity: 0.55; }
+
+.metric-card { padding-bottom: 12px; }
+.table-wrap { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th, td { padding: 9px 10px; border-bottom: 1px solid #26314a; text-align: left; white-space: nowrap; }
+th { color: #7a869e; font-weight: 500; background: #1a2333; }
+td.actions { display: flex; gap: 8px; align-items: center; }
+.badge { display: inline-block; min-width: 42px; text-align: center; padding: 2px 8px; border-radius: 12px; font-size: 12px; }
+.badge.active { color: #66bb6a; background: rgba(102,187,106,0.12); }
+.badge.silent { color: #ffb74d; background: rgba(255,183,77,0.12); }
+.badge.archived { color: #90a4ae; background: rgba(144,164,174,0.12); }
+button.danger { color: #ff8a80; border-color: #7f3b42; background: #3a2028; }
+button:disabled, select:disabled { opacity: 0.55; cursor: not-allowed; }
 
 .chart-card {
   background: #161d2c;
