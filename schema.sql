@@ -132,8 +132,16 @@ END $$
 DROP PROCEDURE IF EXISTS p_downsample_hour $$
 CREATE PROCEDURE p_downsample_hour(IN hour_start DATETIME)
 BEGIN
-    -- 活跃和静默指标仍参与预聚合; 归档指标不再产生新的预聚合数据。
-    -- 静默预聚合结果会在查询入口按 metrics.status='active' 被排除。
+    -- 降采样是已落库数据的物化维护, 与当前查询可见性解耦:
+    -- 静默/归档期间仍保留的历史数据参与其所属小时桶; 归档后没有新数据, 不会产生新桶。
+    -- 与归档清理共用 tsdb_metric_maintenance 命名锁, 避免清理删除后又被本任务重新聚合;
+    -- 不锁元数据行, 避免降采样阻塞其他指标的正常写入。
+    DECLARE locked TINYINT DEFAULT 0;
+    SELECT GET_LOCK('tsdb_metric_maintenance', 60) INTO locked;
+    IF locked <> 1 THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'acquire metric maintenance lock timeout';
+    END IF;
+
     INSERT INTO metric_data_hourly (metric_id, bucket_ts, avg_value, min_value, max_value, sum_value, point_count)
     SELECT d.metric_id,
            hour_start,
@@ -141,7 +149,6 @@ BEGIN
       FROM metric_data d
       JOIN metrics m ON m.id = d.metric_id
      WHERE d.ts >= hour_start AND d.ts < hour_start + INTERVAL 1 HOUR
-       AND m.status IN ('active', 'silent')
      GROUP BY d.metric_id
     ON DUPLICATE KEY UPDATE
         avg_value   = VALUES(avg_value),
@@ -149,6 +156,8 @@ BEGIN
         max_value   = VALUES(max_value),
         sum_value   = VALUES(sum_value),
         point_count = VALUES(point_count);
+
+    SELECT RELEASE_LOCK('tsdb_metric_maintenance');
 END $$
 
 -- ---------------------------------------------------------------

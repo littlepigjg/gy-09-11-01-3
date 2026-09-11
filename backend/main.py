@@ -83,9 +83,17 @@ app.add_middleware(
 )
 
 
+METRIC_MAINTENANCE_LOCK = "tsdb_metric_maintenance"
+
 DOWNSAMPLE_HOUR_PROCEDURE = """
 CREATE PROCEDURE p_downsample_hour(IN hour_start DATETIME)
 BEGIN
+    DECLARE locked TINYINT DEFAULT 0;
+    SELECT GET_LOCK('tsdb_metric_maintenance', 60) INTO locked;
+    IF locked <> 1 THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'acquire metric maintenance lock timeout';
+    END IF;
+
     INSERT INTO metric_data_hourly (metric_id, bucket_ts, avg_value, min_value, max_value, sum_value, point_count)
     SELECT d.metric_id,
            hour_start,
@@ -93,7 +101,6 @@ BEGIN
       FROM metric_data d
       JOIN metrics m ON m.id = d.metric_id
      WHERE d.ts >= hour_start AND d.ts < hour_start + INTERVAL 1 HOUR
-       AND m.status IN ('active', 'silent')
      GROUP BY d.metric_id
     ON DUPLICATE KEY UPDATE
         avg_value   = VALUES(avg_value),
@@ -101,6 +108,8 @@ BEGIN
         max_value   = VALUES(max_value),
         sum_value   = VALUES(sum_value),
         point_count = VALUES(point_count);
+
+    SELECT RELEASE_LOCK('tsdb_metric_maintenance');
 END
 """
 
@@ -356,9 +365,10 @@ def update_metric_status(metric_id: int, req: MetricStatusUpdate):
             # FOR UPDATE 后通常不会走到这里; 兜底处理极端并发/复制场景。
             raise HTTPException(status_code=409, detail="metric status version conflict")
 
-        # 从归档恢复时, 在同一个事务内补齐缺失的小时桶。
-        # 这样提交后无论查询走原始表还是小时预聚合表, 历史数据可见性都同时切换。
-        if metric["status"] == "archived" and req.status in ("active", "silent"):
+        # 恢复活跃时, 在同一个事务内补齐缺失的小时桶。
+        # 静默期间的原始数据仍被采集, 激活后本就应恢复可见; 这里保证提交后
+        # 无论查询走原始表还是小时预聚合表, 历史数据都在同一提交点一致出现。
+        if metric["status"] in ("silent", "archived") and req.status == "active":
             cur.execute(
                 """
                 INSERT INTO metric_data_hourly
@@ -393,19 +403,25 @@ def cleanup_archived_metric(metric_id: int):
 
     归档只负责阻断新写入并隐藏数据; 历史数据清理是高风险操作, 因此要求指标
     已处于 archived 后单独确认。清理在同一事务内先删原始数据再删小时预聚合,
-    状态行排他锁与降采样任务的元数据读取互斥, 避免清理后又被重新聚合。
+    并获取维护命名锁, 与小时降采样任务串行, 避免清理后又被重新聚合。
     """
     with pool.acquire() as conn, conn.cursor() as cur:
-        cur.execute("SELECT status FROM metrics WHERE id=%s FOR UPDATE", (metric_id,))
-        metric = cur.fetchone()
-        if metric is None:
-            raise HTTPException(status_code=404, detail="metric not found")
-        if metric["status"] != "archived":
-            raise HTTPException(status_code=409, detail="only archived metrics can be cleaned")
-        cur.execute("DELETE FROM metric_data WHERE metric_id=%s", (metric_id,))
-        raw_deleted = cur.rowcount
-        cur.execute("DELETE FROM metric_data_hourly WHERE metric_id=%s", (metric_id,))
-        hourly_deleted = cur.rowcount
+        cur.execute("SELECT GET_LOCK(%s, 60) AS locked", (METRIC_MAINTENANCE_LOCK,))
+        if cur.fetchone()["locked"] != 1:
+            raise HTTPException(status_code=503, detail="metric maintenance is busy")
+        try:
+            cur.execute("SELECT status FROM metrics WHERE id=%s FOR UPDATE", (metric_id,))
+            metric = cur.fetchone()
+            if metric is None:
+                raise HTTPException(status_code=404, detail="metric not found")
+            if metric["status"] != "archived":
+                raise HTTPException(status_code=409, detail="only archived metrics can be cleaned")
+            cur.execute("DELETE FROM metric_data WHERE metric_id=%s", (metric_id,))
+            raw_deleted = cur.rowcount
+            cur.execute("DELETE FROM metric_data_hourly WHERE metric_id=%s", (metric_id,))
+            hourly_deleted = cur.rowcount
+        finally:
+            cur.execute("SELECT RELEASE_LOCK(%s)", (METRIC_MAINTENANCE_LOCK,))
     return {
         "id": metric_id,
         "cleaned": True,
